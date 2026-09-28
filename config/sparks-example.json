@@ -1,0 +1,32 @@
+{
+  "$comment": "Jetson host entry for SparkDash config/sparks.json. kind must be 'host'. SSH user root is needed for the shim to read nvmap/INA3221/devfreq.",
+  "sparks": [
+    {
+      "id": "jetson",
+      "name": "Jetson Orin Nano",
+      "kind": "host",
+      "lanIp": "192.0.2.10",
+      "cx7Ip": null,
+      "macAddress": null,
+      "isLocal": false,
+      "ssh": {
+        "host": "192.0.2.10",
+        "user": "root",
+        "auth": "key"
+      },
+      "llmPorts": [],
+      "role": "head",
+      "workerNode": false,
+      "workerLabel": null,
+      "workerHeadId": null,
+      "llmMonitoring": false,
+      "comfyMonitoring": false,
+      "comfyPort": 8188,
+      "tailscaleMonitoring": false,
+      "hermesMonitoring": false,
+      "disabledDevices": [],
+      "disabledInterfaces": [],
+      "storagePollDisabled": false
+    }
+  ]
+}

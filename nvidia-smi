@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
+"""
+nvidia-smi shim for NVIDIA Jetson (Orin / Orin-Nano / Xavier / Nano) - fully
+self-contained, works with ZERO external services (no jtop / jetson-stats).
+
+Jetson boards run Tegra JetPack Linux and ship with NO functional nvidia-smi:
+the stock binary fails with "NVIDIA-SMI has failed because it couldn't
+communicate with the NVIDIA driver". This drops in as /usr/bin/nvidia-smi and
+answers the exact query contract SparkDash (and other SSH-based monitors) use
+so a Jetson can be tracked as a generic "host" GPU node.
+
+Everything is read directly from the kernel (root is sufficient):
+
+  utilization.gpu       /sys/devices/platform/bus@*/<gpu>/load   (/10 = %)
+  power.draw            INA3221 VDD_IN rail  (in1_mV x curr1_mA)  = all rails
+  temperature.gpu       GPU thermal zone (thermal_zone*/type == gpu-thermal)
+  memory.total          MemTotal (unified CPU/GPU pool)
+  memory.used           GPU/shared memory in use (nvmap iovmm maps table)
+  clocks.cur/max.sm     GPU devfreq cur_freq / max_freq
+  --query-compute-apps  processes holding GPU (nvmap) memory (pid, name, MiB)
+
+These are exactly the sources jetson-stats' jtop reads - just without the
+jtop daemon or Python dependency, so the shim is independent and fast
+(sub-millisecond reads, no 0.8 s jtop handshake, no group membership, no cache).
+
+Install
+-------
+  sudo install -m 0755 nvidia-smi /usr/bin/nvidia-smi
+Run as root so it can read /sys/kernel/debug/nvmap and the INA3221 rails.
+"""
+
+import os
+import re
+import sys
+
+# --------------------------------------------------------------------------- #
+# Tunables
+# --------------------------------------------------------------------------- #
+GPU_NAME = "NVIDIA Jetson Orin Nano"
+DRIVER_VERSION = "JetPack (native sysfs shim)"
+POWER_LIMIT_W = 25.0        # MAXN_SUPER SoM power budget; set to your board's cap
+NV_MAPS = "/sys/kernel/debug/nvmap/iovmm/maps"
+
+# --------------------------------------------------------------------------- #
+# Tiny readers
+# --------------------------------------------------------------------------- #
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except (IOError, OSError):
+        return None
+
+
+def _fmeminfo():
+    data = _read("/proc/meminfo")
+    if not data:
+        return {}
+    return {m.group(1): int(m.group(2))
+            for m in re.finditer(r"^(\w+):\s+(\d+)\s+kB", data, re.M)}
+
+
+def _gpu_nodes():
+    """Return (devfreq_node, device_realpath) for the iGPU, or (None, None)."""
+    base = "/sys/class/devfreq"
+    try:
+        if not os.path.isdir(base):
+            return None, None
+        for item in os.listdir(base):
+            name_p = f"{base}/{item}/device/of_node/name"
+            if not os.path.isfile(name_p):
+                continue
+            name = (_read(name_p) or "").strip(" \x00").lower()
+            if "gpu" in name:
+                dev = os.path.realpath(f"{base}/{item}/device")
+                return f"{base}/{item}", dev
+    except OSError:
+        pass
+    return None, None
+
+
+def _gpu_load_pct():
+    """GPU engine busy %, 0-100, straight from the kernel (what jtop reads)."""
+    _, dev = _gpu_nodes()
+    if not dev:
+        return 0.0
+    v = _read(f"{dev}/load")
+    if v is None:
+        return 0.0
+    try:
+        return max(0.0, min(100.0, float(v) / 10.0))
+    except ValueError:
+        return 0.0
+
+
+def _sm_clocks():
+    freqs, _ = _gpu_nodes()
+    if not freqs:
+        return 0, 0
+    c, m = _read(f"{freqs}/cur_freq"), _read(f"{freqs}/max_freq")
+    try:
+        return (int(c) / 1_000_000.0 if c else 0,
+                int(m) / 1_000_000.0 if m else 0)
+    except ValueError:
+        return 0, 0
+
+
+def _gpu_temp_c():
+    for i in range(8):
+        t = (_read(f"/sys/class/thermal/thermal_zone{i}/type") or "").lower()
+        if "gpu" in t or "tj" in t:
+            raw = _read(f"/sys/class/thermal/thermal_zone{i}/temp")
+            if raw:
+                try:
+                    return float(raw) / 1000.0
+                except ValueError:
+                    return 0.0
+    return 0.0
+
+
+def _power_w():
+    """Total board power (VDD_IN) via INA3221: in1_mV x curr1_mA -> W."""
+    for i in range(8):
+        if _read(f"/sys/class/hwmon/hwmon{i}/name") != "ina3221":
+            continue
+        lab = _read(f"/sys/class/hwmon/hwmon{i}/in1_label") or ""
+        if "VDD_IN" in lab:
+            mv = _read(f"/sys/class/hwmon/hwmon{i}/in1_input")
+            ma = _read(f"/sys/class/hwmon/hwmon{i}/curr1_input")
+            if mv and ma:
+                try:
+                    return float(mv) * float(ma) / 1_000_000.0
+                except ValueError:
+                    return 0.0
+    return 0.0
+
+
+# /proc/meminfo lacks a GPU key on this board, so GPU memory is the nvmap
+# process table (the same data jtop uses). Readable as root via debugfs.
+_PROC_RE = re.compile(r"^\S+\s+(?P<name>\S+)\s+(?P<pid>\d+)\s+(?P<size>\d+)K\s*$")
+
+
+def _nvmap_procs():
+    """Return (procs, total_mb): GPU processes and total nvmap memory in MiB."""
+    data = _read(NV_MAPS)
+    if not data:
+        return [], 0
+    procs, kb = [], 0
+    for line in data.splitlines():
+        m = _PROC_RE.match(line)
+        if m:
+            sz = int(m.group("size"))
+            kb += sz
+            procs.append({"pid": int(m.group("pid")),
+                          "name": m.group("name"),
+                          "vramMB": round(sz / 1024.0)})
+    seen, out = set(), []
+    for p in sorted(procs, key=lambda x: -x["vramMB"]):
+        if p["pid"] in seen:
+            continue
+        seen.add(p["pid"])
+        out.append(p)
+    return out, round(kb / 1024.0)
+
+
+# --------------------------------------------------------------------------- #
+# Snapshot (all raw)
+# --------------------------------------------------------------------------- #
+
+def snapshot():
+    mem = _fmeminfo()
+    procs, vram_used = _nvmap_procs()
+    if not vram_used:
+        vram_used = mem.get("NvMapMemUsed", 0) // 1024
+    sm_cur, sm_max = _sm_clocks()
+    return {
+        "gpu_util": _gpu_load_pct(),
+        "power_w": _power_w(),
+        "power_limit_w": POWER_LIMIT_W,
+        "temp_c": _gpu_temp_c(),
+        "vram_total_mb": mem.get("MemTotal", 0) // 1024,
+        "vram_used_mb": vram_used,
+        "sm_cur": sm_cur,
+        "sm_max": sm_max,
+        "throttled": False,
+        "procs": procs,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Output formatting
+# --------------------------------------------------------------------------- #
+
+def _nounits(args):
+    return any("nounits" in a for a in args)
+
+
+def _fmt_field(name, s, nu):
+    if name == "name":
+        return GPU_NAME
+    if name == "driver_version":
+        return DRIVER_VERSION
+    if name == "pci.bus_id":
+        return "00000000:00:00.0"
+    if name == "uuid":
+        return "GPU-00000000-0000-0000-0000-000000000000"
+    if name == "temperature.gpu":
+        return str(int(round(s["temp_c"])))
+    if name == "utilization.gpu":
+        return "%d %%" % int(round(s["gpu_util"]))
+    if name == "power.draw":
+        return ("%.2f W" % s["power_w"]) if not nu else "%.2f" % s["power_w"]
+    if name == "power.limit":
+        return ("%.2f W" % s["power_limit_w"]) if not nu else "%.2f" % s["power_limit_w"]
+    if name == "memory.total":
+        return ("%d MiB" % s["vram_total_mb"]) if not nu else str(s["vram_total_mb"])
+    if name == "memory.used":
+        return ("%d MiB" % s["vram_used_mb"]) if not nu else str(s["vram_used_mb"])
+    if name == "memory.free":
+        free = max(0, s["vram_total_mb"] - s["vram_used_mb"])
+        return ("%d MiB" % free) if not nu else str(free)
+    if name == "clocks.current.sm":
+        return str(int(round(s["sm_cur"])))
+    if name == "clocks.max.sm":
+        return str(int(round(s["sm_max"])))
+    if name.startswith("clocks_throttle_reasons"):
+        return "Active" if s["throttled"] and name in (
+            "clocks_throttle_reasons.hw_thermal_slowdown",
+            "clocks_throttle_reasons.sw_thermal_slowdown",
+        ) else "Not Active"
+    return "0"
+
+
+def _query_gpu(args):
+    snap = snapshot()
+    nu = _nounits(args)
+    q = next((a for a in args if a.startswith("--query-gpu=")), "")
+    fields = [f.strip() for f in q.split("=", 1)[1].split(",") if f.strip()]
+    print(", ".join(_fmt_field(f, snap, nu) for f in fields))
+    return 0
+
+
+def _compute_apps(args):
+    snap = snapshot()
+    nu = _nounits(args)
+    for p in snap["procs"]:
+        mem = ("%d MiB" % p["vramMB"]) if not nu else str(p["vramMB"])
+        print("%d, %s, %s" % (p["pid"], p["name"], mem))
+    return 0
+
+
+def _dmon(args):
+    s = snapshot()
+    print("# gpu   pwr gfeact encdec mclk pclk")
+    print("# Idx     W      %      %    %    %")
+    print("    0    %4.1f    %3d      0    0    0" % (s["power_w"], int(round(s["gpu_util"]))))
+    return 0
+
+
+def _list_gpus():
+    print("GPU 0: %s (UUID: GPU-00000000-0000-0000-0000-000000000000)" % GPU_NAME)
+    return 0
+
+
+def _full_query():
+    s = snapshot()
+    bar = "=" * 79
+    print(bar)
+    print(" %-40s " % GPU_NAME)
+    print(" | %-39s " % "NVIDIA-SMI shim (native sysfs)")
+    print(bar)
+    print(" Driver / Power   : %s / MAXN_SUPER" % DRIVER_VERSION)
+    print("")
+    print("  GPU  Name                  Temp  Power   Bus Id   Util / Clocks")
+    print("                             %-4s %-6s %-8s %-5s %-16s" % ("(C)", "W", "", "%", "MHz"))
+    print("  0    %-22s %-3s %6.1f   -        %3d%%    %-6s/%s" % (
+        GPU_NAME, int(round(s["temp_c"])), s["power_w"],
+        int(round(s["gpu_util"])), int(round(s["sm_cur"])), int(round(s["sm_max"]))))
+    print("")
+    print("  Memory (unified pool)")
+    print("    GPU(nvmap) / MemTotal : %5d MiB / %d MiB" % (s["vram_used_mb"], s["vram_total_mb"]))
+    print("")
+    print("  Processes")
+    if s["procs"]:
+        print("    %-8s  %-24s  %8s" % ("PID", "Name", "GPU Mem"))
+        for p in s["procs"]:
+            print("    %-8d  %-24s  %6d MiB" % (p["pid"], p["name"][:24], p["vramMB"]))
+    else:
+        print("    (none)")
+    print(bar)
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if any(a in args for a in ("dmon",)):
+        return _dmon(args)
+    if any(a.startswith("--query-compute-apps") for a in args):
+        return _compute_apps(args)
+    if any(a.startswith("--query-gpu=") for a in args):
+        return _query_gpu(args)
+    if "-L" in args or "--list-gpus" in args:
+        return _list_gpus()
+    if "-q" in args or "--query" in args:
+        return _full_query()
+    if any(a in ("--help", "-h") for a in args):
+        print(("Usage: nvidia-smi [options]\n"
+               "Drop-in shim for NVIDIA Jetson (native sysfs, no external services).\n"
+               "  --query-gpu=<fields,...>   csv values\n"
+               "  --query-compute-apps=pid,process_name,used_gpu_memory\n"
+               "  -L / --list-gpus           list GPU\n"
+               "  -q / --query               verbose table\n"
+               "  dmon                       sampling stub\n"))
+        return 0
+    s = snapshot()
+    print("%s | Temp: %.0fC | GPU Util: %d%% | VRAM: %dMiB / %dMiB | Power: %.1fW" % (
+        GPU_NAME, s["temp_c"], int(round(s["gpu_util"])),
+        s["vram_used_mb"], s["vram_total_mb"], s["power_w"]))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
