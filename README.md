@@ -11,20 +11,6 @@ This script installs as `/usr/bin/nvidia-smi` and answers the exact query
 contract that SparkDash (and other SSH-based monitors) use, returning **live,
 responsive** GPU stats.
 
-## Why another nvidia-smi?
-
-The previous shim on the author's Orin Nano faked its numbers:
-`gpu_util` was statically `0 %` or `30 %` depending on whether a process named
-`llama`/`ollama` was running, and `power.draw` was a hardcoded `3.8 W` /
-`13.1 W`. It never tracked real load. This version reads real telemetry so the
-dashboard actually moves when the GPU works:
-
-| metric | idle | under load (`qwen2.5:7b` generation) |
-|---|---|---|
-| `utilization.gpu` | 0 % | 95–100 % |
-| `power.draw` | ~7.4 W | ~22 W |
-| `temperature.gpu` | ~49 °C | ~58 °C |
-
 ## What it reports
 
 | nvidia-smi field | source |
